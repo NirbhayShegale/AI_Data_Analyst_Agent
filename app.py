@@ -1,25 +1,17 @@
 
-import os
+import hashlib
 
 import streamlit as st
-from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage
 
-from services.data_loader import load_dataset, preprocess_dataset
+from data_loader import load_dataset, preprocess_dataset
 
-from services.llm_client import get_llm
-from services.intent_classifier import classify_intent
-from services.sql_generator import generate_sql
-from services.sql_validator import validate_sql
-from services.query_executor import execute_query
-from services.answer_generator import generate_answer
+from services.llm_client import get_config, get_llm
+from agents.analyst_graph import create_analyst_graph
 
 
 # --------------------------------------------------
 # 1. PAGE CONFIGURATION
 # --------------------------------------------------
-
-load_dotenv()
 
 st.set_page_config(
     page_title="AI Data Analyst Agent",
@@ -28,280 +20,260 @@ st.set_page_config(
 )
 
 st.title("AI Data Analyst Agent")
-st.caption("Ask questions about your uploaded dataset.")
-
-
-# --------------------------------------------------
-# 2. LLM CONFIGURATION
-# --------------------------------------------------
-
-def get_setting(name: str, default: str = "") -> str:
-    value = os.getenv(name)
-
-    if value:
-        return value
-
-    try:
-        return str(st.secrets.get(name, default))
-    except Exception:
-        return default
-
-
-api_key = get_setting("GROQ_API_KEY")
-model_name = get_setting("GROQ_MODEL", "qwen/qwen3.8-27b")
-
-if not api_key:
-    st.error("Configure GROQ_API_KEY in your .env file or app secrets.")
-    st.stop()
-
-llm = get_llm(api_key, model_name)
-
-
-# --------------------------------------------------
-# 3. UPLOAD AND PREPROCESS DATA
-# --------------------------------------------------
-
-uploaded_file = st.file_uploader(
-    "Upload CSV or Excel",
-    type=["csv", "xlsx", "xls"],
+st.caption(
+    "Ask questions about your CSV or Excel dataset using natural language."
 )
 
-if uploaded_file is None:
-    st.info("Upload a dataset to start asking questions.")
-    st.stop()
-
-try:
-    original_df = load_dataset(uploaded_file)
-    df = preprocess_dataset(original_df)
-
-    if df.empty or len(df.columns) == 0:
-        st.error("The processed dataset is empty.")
-        st.stop()
-
-except Exception as exc:
-    st.error(f"Could not load or preprocess the dataset: {exc}")
-    st.stop()
-
 
 # --------------------------------------------------
-# 4. DATASET OVERVIEW AND SCHEMA
-# --------------------------------------------------
-
-col1, col2, col3 = st.columns(3)
-
-col1.metric("Rows", f"{len(df):,}")
-col2.metric("Columns", len(df.columns))
-col3.metric("Missing cells",f"{int(df.isna().sum().sum()):,}",)
-
-with st.expander("Preview dataset"):
-    st.dataframe(df.head(10), use_container_width=True)
-
-schema = "\n".join(
-    f"- {column!r}: {dtype}"
-    for column, dtype in df.dtypes.items()
-)
-
-with st.expander("Available columns"):
-    st.code(schema)
-
-
-# --------------------------------------------------
-# 5. GENERAL QUESTION HANDLER
-# --------------------------------------------------
-
-def answer_general_question(question: str) -> str:
-    """Answer greetings and general capability questions."""
-
-    response = llm.invoke([
-        SystemMessage(content="""
-You are a helpful AI Data Analyst Agent.
-
-Answer greetings and general questions about your capabilities.
-Explain that you can analyze the user's uploaded dataset,
-return tables, calculate metrics, and explain trends.
-
-Do not claim to have analyzed the dataset unless you actually
-performed a data query.
-Keep the response concise.
-"""),
-        HumanMessage(content=question),
-    ])
-
-    return response.content.strip()
-
-
-# --------------------------------------------------
-# 6. CHAT HISTORY
+# 2. SESSION STATE
 # --------------------------------------------------
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "dataset_id" not in st.session_state:
+    st.session_state.dataset_id = None
+
+if "dataset_df" not in st.session_state:
+    st.session_state.dataset_df = None
+
+if "dataset_name" not in st.session_state:
+    st.session_state.dataset_name = None
+
+if "analyst_graph" not in st.session_state:
+    st.session_state.analyst_graph = None
+
+if "graph_model" not in st.session_state:
+    st.session_state.graph_model = None
+
+
+# --------------------------------------------------
+# 3. INITIALIZE GROQ AND LANGGRAPH
+# --------------------------------------------------
+
+try:
+    api_key, model_name = get_config()
+
+    llm = get_llm(api_key, model_name)
+
+    # Rebuild the graph only if its model configuration changes.
+    if st.session_state.graph_model != model_name:
+        st.session_state.analyst_graph = create_analyst_graph(llm)
+        st.session_state.graph_model = model_name
+
+except Exception as exc:
+    st.error(f"LLM initialization failed: {exc}")
+    st.stop()
+
+
+# --------------------------------------------------
+# 4. UPLOAD DATASET
+# --------------------------------------------------
+
+uploaded_file = st.file_uploader(
+    "Upload your dataset",
+    type=["csv", "xlsx", "xls"],
+)
+
+if uploaded_file is None:
+    st.info("Upload a dataset to start.")
+    st.stop()
+
+
+# Detect whether a different file was uploaded.
+file_hash = hashlib.sha256(
+    uploaded_file.getvalue()
+).hexdigest()
+
+dataset_id = f"{uploaded_file.name}:{file_hash}"
+
+
+if st.session_state.dataset_id != dataset_id:
+    try:
+        with st.spinner("Loading and preprocessing dataset..."):
+            original_df = load_dataset(uploaded_file)
+            cleaned_df = preprocess_dataset(original_df)
+
+            if cleaned_df is None or cleaned_df.empty:
+                st.error(
+                    "The dataset is empty after preprocessing."
+                )
+                st.stop()
+
+            st.session_state.dataset_df = cleaned_df
+            st.session_state.dataset_id = dataset_id
+            st.session_state.dataset_name = uploaded_file.name
+
+            # Results from a previous dataset must not be mixed
+            # with results from a new dataset.
+            st.session_state.messages = []
+
+    except Exception as exc:
+        st.error(f"Dataset loading failed: {exc}")
+        st.stop()
+
+
+df = st.session_state.dataset_df
+
+
+# --------------------------------------------------
+# 5. DATASET OVERVIEW
+# --------------------------------------------------
+
+st.success(f"Dataset loaded: {st.session_state.dataset_name}")
+
+col1, col2, col3 = st.columns(3)
+
+col1.metric("Rows", f"{len(df):,}")
+col2.metric("Columns", len(df.columns))
+col3.metric(
+    "Missing values",
+    f"{int(df.isna().sum().sum()):,}",
+)
+
+with st.expander("Preview dataset"):
+    st.dataframe(
+        df.head(10),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+with st.expander("Dataset schema"):
+    schema_df = df.dtypes.astype(str).reset_index()
+    schema_df.columns = ["Column", "Data Type"]
+
+    st.dataframe(
+        schema_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+schema = "\n".join(
+    f"- {column}: {dtype}"
+    for column, dtype in df.dtypes.items()
+)
+
+
+# --------------------------------------------------
+# 6. RENDER SAVED CHAT HISTORY
+# --------------------------------------------------
+
+st.divider()
+st.subheader("Chat with your data")
+
 for message in st.session_state.messages:
+
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+
+        if message.get("content"):
+            st.markdown(message["content"])
+
+        if message.get("sql"):
+            with st.expander("View SQL"):
+                st.code(message["sql"], language="sql")
+
+        result_df = message.get("result_df")
+
+        if result_df is not None:
+            if result_df.empty:
+                st.info("No matching records were found.")
+            else:
+                st.dataframe(
+                    result_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        if message.get("truncated"):
+            st.warning(
+                "The displayed results were limited to 1,000 rows."
+            )
 
 
 # --------------------------------------------------
-# 7. INTENT-BASED ROUTING
+# 7. PROCESS A NEW QUESTION
 # --------------------------------------------------
 
-question = st.chat_input("Ask a question about your data...")
+question = st.chat_input("Ask a question about your dataset...")
 
 if question:
+
+    # Store the user query before processing.
     st.session_state.messages.append({
         "role": "user",
         "content": question,
     })
 
-    with st.chat_message("user"):
-        st.markdown(question)
+    try:
+        with st.spinner("Running the agent graph..."):
 
-    saved_response = ""
+            result = st.session_state.analyst_graph.invoke({
+                "question": question,
+                "df": df,
+                "schema": schema,
+            })
 
-    with st.chat_message("assistant"):
-        try:
-            # STEP A: Understand what the user wants.
-            with st.spinner("Understanding your question..."):
-                classification = classify_intent(question, llm)
+        intent = result["intent"]
+        answer = result.get("answer")
+        sql = result.get("sql")
+        result_df = result.get("result_df")
+        truncated = result.get("truncated", False)
 
-            intent = classification["intent"]
+        # Choose the response text and whether to show a table.
+        if intent == "table":
+            content = "Here are the query results."
+            display_df = result_df
 
-            # Display only when debugging the application.
-            # Remove this expander for a cleaner production UI.
-            with st.expander("Request details"):
-                st.write("Detected intent:", intent)
-                st.write("Reason:", classification["reason"])
+        elif intent == "answer":
+            content = answer or "No answer was generated."
+            display_df = None
 
-            # ------------------------------------------
-            # ROUTE 1: GENERAL CONVERSATION
-            # ------------------------------------------
+        elif intent == "both":
+            content = answer or "Here are the query results."
+            display_df = result_df
 
-            if intent == "general":
-                answer = answer_general_question(question)
+        else:
+            content = answer or "How can I help you?"
+            display_df = None
 
-                st.markdown(answer)
-                saved_response = answer
+        # Save everything needed to recreate this response
+        # when Streamlit reruns.
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": content,
+            "sql": sql,
+            "result_df": (
+                display_df.copy()
+                if display_df is not None
+                else None
+            ),
+            "truncated": truncated,
+        })
 
-            # ------------------------------------------
-            # ROUTES 2, 3 AND 4: DATA QUESTIONS
-            # ------------------------------------------
+    except Exception as exc:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": (
+                "The agent could not process this question.\n\n"
+                f"**Error:** `{str(exc)}`"
+            ),
+            "sql": None,
+            "result_df": None,
+            "truncated": False,
+        })
 
-            else:
-                # Generate SQL only when data is needed.
-                with st.spinner("Generating SQL..."):
-                    generated_sql = generate_sql(
-                        question,
-                        schema,
-                        llm,
-                    )
+    # Rerender the complete conversation, including older tables.
+    st.rerun()
 
-                # Validate before execution.
-                safe_sql = validate_sql(generated_sql)
 
-                # Execute against the full processed dataset.
-                with st.spinner("Analyzing your data..."):
-                    result_df, truncated = execute_query(
-                        df,
-                        safe_sql,
-                    )
+# --------------------------------------------------
+# 8. CLEAR CHAT
+# --------------------------------------------------
 
-                # --------------------------------------
-                # ROUTE 2: TABLE ONLY
-                # --------------------------------------
+st.divider()
 
-                if intent == "table":
-                    st.subheader("Query results")
-
-                    st.dataframe(
-                        result_df,
-                        use_container_width=True,
-                    )
-
-                    if truncated:
-                        st.info(
-                            "The result has more rows than displayed."
-                        )
-
-                    with st.expander("View generated SQL"):
-                        st.code(safe_sql, language="sql")
-
-                    saved_response = (
-                        f"**Query results**\n\n"
-                        f"{len(result_df)} result rows returned."
-                    )
-
-                # --------------------------------------
-                # ROUTE 3: ANSWER ONLY
-                # --------------------------------------
-
-                elif intent == "answer":
-                    with st.spinner("Preparing your answer..."):
-                        answer = generate_answer(
-                            question=question,
-                            sql=safe_sql,
-                            result_df=result_df,
-                            llm=llm,
-                            truncated=truncated,
-                        )
-
-                    st.markdown(answer)
-
-                    # SQL is available but not shown by default.
-                    with st.expander("View generated SQL"):
-                        st.code(safe_sql, language="sql")
-
-                    saved_response = answer
-
-                # --------------------------------------
-                # ROUTE 4: BOTH TABLE AND ANSWER
-                # --------------------------------------
-
-                elif intent == "both":
-                    st.subheader("Analysis")
-
-                    with st.spinner("Interpreting query results..."):
-                        answer = generate_answer(
-                            question=question,
-                            sql=safe_sql,
-                            result_df=result_df,
-                            llm=llm,
-                            truncated=truncated,
-                        )
-
-                    st.markdown(answer)
-
-                    st.subheader("Supporting data")
-
-                    st.dataframe(
-                        result_df,
-                        use_container_width=True,
-                    )
-
-                    if truncated:
-                        st.info(
-                            "The result has more rows than displayed."
-                        )
-
-                    with st.expander("View generated SQL"):
-                        st.code(safe_sql, language="sql")
-
-                    saved_response = (
-                        f"**Analysis**\n\n{answer}\n\n"
-                        f"**Supporting data**\n\n"
-                        f"{len(result_df)} result rows returned."
-                    )
-
-        except Exception as exc:
-            st.error(f"Could not complete your request: {exc}")
-
-            saved_response = (
-                "I couldn't complete that request. "
-                "Please rephrase your question or check the dataset."
-            )
-
-    # Save assistant message for future Streamlit reruns.
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": saved_response,
-    })
+if st.button("Clear chat history"):
+    st.session_state.messages = []
+    st.rerun()
